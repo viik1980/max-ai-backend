@@ -34,7 +34,17 @@ registerCanaryRoute(app); // приманка-эндпоинт /api/admin/config
 const PORT = process.env.PORT || 8080;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
-const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/interactions';
+// 🔥 generateContent, а не Interactions API — тот стабильный, этот
+// экспериментальный и уже дважды ломал схему за несколько месяцев
+// (outputs→steps в мае, turn_list→step_list сейчас). Сам Google прямо
+// пишет в доке: "for production workloads, continue to use the
+// standard generateContent API. It remains the recommended path for
+// stable deployments." — не гоняемся за новизной там, где нужна
+// предсказуемость.
+const GEMINI_URL = (streaming) =>
+  `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:${
+    streaming ? 'streamGenerateContent' : 'generateContent'
+  }`;
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY || '';
 
 if (!GOOGLE_MAPS_API_KEY) {
@@ -139,38 +149,37 @@ app.use('/api/', limiter);
 app.get('/health', (req, res) => res.json({ ok: true, model: GEMINI_MODEL }));
 
 // -----------------------------------------------------------------
-// Собираем "input" для Interactions API.
+// Собираем "contents" для generateContent.
 // history — чистый диалог без телеметрии: [{role:'user'|'model', text:'...'}]
 // (совпадает с тем, что сейчас лежит в AiService._chatHistory, только
 // без системного сообщения — оно теперь всегда system_instruction).
 // -----------------------------------------------------------------
-function buildInput(history, userText, imageBase64, imageMimeType) {
-  const input = [];
+function buildContents(history, userText, imageBase64, imageMimeType) {
+  const contents = [];
   for (const turn of history || []) {
     const role = turn.role === 'assistant' || turn.role === 'model' ? 'model' : 'user';
-    input.push({ role, content: [{ type: 'text', text: turn.text }] });
+    contents.push({ role, parts: [{ text: turn.text }] });
   }
-  const userContent = [{ type: 'text', text: userText }];
+  const parts = [{ text: userText }];
   if (imageBase64) {
-    userContent.push({
-      type: 'image',
-      data: imageBase64,
-      mime_type: imageMimeType || 'image/jpeg',
+    parts.push({
+      inline_data: {
+        mime_type: imageMimeType || 'image/jpeg',
+        data: imageBase64,
+      },
     });
   }
-  input.push({ role: 'user', content: userContent });
-  return input;
+  contents.push({ role: 'user', parts });
+  return contents;
 }
 
-// Достаёт из нового (steps) ответа Gemini весь текст модели одной строкой.
+// Достаёт текст модели из ответа generateContent.
 function extractText(json) {
-  const steps = json.steps || json.outputs || [];
+  const candidate = (json.candidates || [])[0];
+  const parts = candidate?.content?.parts || [];
   let text = '';
-  for (const step of steps) {
-    const content = step.content || (step.type === 'text' ? [step] : []);
-    for (const part of content) {
-      if (part.type === 'text' && part.text) text += part.text;
-    }
+  for (const part of parts) {
+    if (part.text) text += part.text;
   }
   return text;
 }
@@ -192,21 +201,19 @@ app.post('/api/max/chat', checkFirebaseAuth, async (req, res) => {
     const systemPrompt = mode === 'advisor' ? MAX_ROUTE_ADVISOR_PROMPT : MAX_SYSTEM_PROMPT;
 
     const body = {
-      model: GEMINI_MODEL,
-      system_instruction: systemPrompt,
-      input: buildInput(history, message, imageBase64, imageMimeType),
-      generation_config: {
+      system_instruction: { parts: [{ text: systemPrompt }] },
+      contents: buildContents(history, message, imageBase64, imageMimeType),
+      generationConfig: {
         temperature: 0.85,
-        max_output_tokens: 1500,
+        maxOutputTokens: 1500,
       },
     };
 
-    const geminiRes = await fetch(GEMINI_URL, {
+    const geminiRes = await fetch(GEMINI_URL(false), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'x-goog-api-key': GEMINI_API_KEY,
-        'Api-Revision': '2026-05-20',
       },
       body: JSON.stringify(body),
     });
@@ -247,23 +254,20 @@ app.post('/api/max/chat/stream', checkFirebaseAuth, async (req, res) => {
   const systemPrompt = mode === 'voice' ? MAX_SYSTEM_PROMPT : MAX_ROUTE_ADVISOR_PROMPT;
 
   const body = {
-    model: GEMINI_MODEL,
-    system_instruction: systemPrompt,
-    input: buildInput(history, message, imageBase64, imageMimeType),
-    generation_config: {
+    system_instruction: { parts: [{ text: systemPrompt }] },
+    contents: buildContents(history, message, imageBase64, imageMimeType),
+    generationConfig: {
       temperature: 0.85,
-      max_output_tokens: 1024,
+      maxOutputTokens: 1024,
     },
-    stream: true,
   };
 
   try {
-    const geminiRes = await fetch(GEMINI_URL, {
+    const geminiRes = await fetch(`${GEMINI_URL(true)}?alt=sse`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'x-goog-api-key': GEMINI_API_KEY,
-        'Api-Revision': '2026-05-20',
         Accept: 'text/event-stream',
       },
       body: JSON.stringify(body),
@@ -294,20 +298,21 @@ app.post('/api/max/chat/stream', checkFirebaseAuth, async (req, res) => {
         const raw = dataLine.slice(5).trim();
         if (!raw) continue;
 
-        let evt;
+        let chunk;
         try {
-          evt = JSON.parse(raw);
+          chunk = JSON.parse(raw);
         } catch {
           continue;
         }
 
-        if (evt.event_type === 'step.delta' && evt.delta && evt.delta.type === 'text') {
-          res.write(`data: ${JSON.stringify({ text: evt.delta.text })}\n\n`);
-        } else if (evt.event_type === 'interaction.completed') {
-          res.write('data: [DONE]\n\n');
+        const text = extractText(chunk);
+        if (text) {
+          res.write(`data: ${JSON.stringify({ text })}\n\n`);
         }
       }
     }
+
+    res.write('data: [DONE]\n\n');
 
     res.end();
   } catch (e) {
